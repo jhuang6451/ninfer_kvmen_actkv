@@ -1,0 +1,18 @@
+[Unit]
+Description=NInfer KVMem ActKV Server for Qwen3.8-27B (RTX 5080)
+After=network-online.target
+
+[Container]
+Image=localhost/ninfer-kvmem-actkv:rtx50
+Network=host
+Volume=%h/Models/Qwen3.8-27B:/models:Z
+AddDevice=nvidia.com/gpu=all
+AddCapability=IPC_LOCK
+SecurityLabelDisable=true
+
+Exec=/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer --port 18200 --model-id ninfer-27b --max-context 262144 --kvmem-recent-tokens 1024 --prefill-chunk 256 --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 --kvmem-action-lrfu --kvmem-lrfu-lambda 0.50 --kvmem-lrfu-top-frac 0.90 --kvmem-score-agg mean --kv-dtype rk8v4 --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp --vision --vision-residency cpu --vision-max-merged 256 --default-reasoning-effort xhigh --default-thinking-budget 53248 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+
+[Service]
+Restart=on-failure
+LimitMEMLOCK=infinity
+RestartSec=10s
