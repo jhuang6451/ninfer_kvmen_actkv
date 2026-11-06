@@ -268,6 +268,12 @@ struct KvMemStoreConfig {
     // Callers that select after scoring set this and call commit_lrfu; callers
     // that cannot report a selection leave it off and keep the score-only rule.
     bool   deferred_lrfu = false;    // --kvmem-lrfu-deferred
+    // Signed evidence: a block whose score is NEGATIVE (the query points away from it)
+    // keeps that evidence instead of being treated as a zero. KS is then not clamped at
+    // zero, so an anti-relevant block ranks below a neutral one until the decay
+    // (lambda per round) pulls it back. Positive growth stays gated by the top-p hit rule
+    // and, in deferred mode, by the round's selection. Off = historical behaviour.
+    bool   lrfu_signed   = false;    // --kvmem-lrfu-signed
 
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;

@@ -328,11 +328,15 @@ void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
             (!thresholded || scores[i] >= threshold);
         if (carried && (selected == nullptr || in_selection[i])) {
             ks += scores[i];
+        } else if (cfg_.lrfu_signed && i < n_score && scores[i] < 0.0) {
+            ks += scores[i];   // negative evidence is never gated by the hit rule
         }
         // AttnScore is a non-negative attention mass. Clamping at 0 keeps a
         // block that went cold able to come back; a negative keep score would
         // rank it last forever (and nothing resets it while it stays resident).
-        if (ks < 0.0) ks = 0.0;
+        // Signed mode drops the clamp: the per-round lambda decay is what lets
+        // a penalised block recover, and the sign is the evidence being kept.
+        if (!cfg_.lrfu_signed && ks < 0.0) ks = 0.0;
         blocks_[i].lrfu_score = ks;
         blocks_[i].attn_score = ks;
     }
@@ -386,8 +390,10 @@ void KvMemStore::set_retrieval_scores(const std::vector<double> &scores,
                 if (i < n_score && scores[i] > 0.0 &&
                     (!mask.thresholded || scores[i] >= mask.threshold)) {
                     ks += scores[i];
+                } else if (cfg_.lrfu_signed && i < n_score && scores[i] < 0.0) {
+                    ks += scores[i];
                 }
-                if (ks < 0.0) ks = 0.0;
+                if (!cfg_.lrfu_signed && ks < 0.0) ks = 0.0;
                 blocks_[i].attn_score = ks;
             }
             return;

@@ -1164,6 +1164,49 @@ static void test_lrfu_accumulates_and_decays() {
     CHECK(s.blocks()[1].lrfu_score == 0.0);
 }
 
+static void test_lrfu_unsigned_ignores_negative_scores() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 3);
+    s.set_retrieval_scores({1.0, -0.5, 0.0}, 1);
+    CHECK(s.blocks()[1].lrfu_score == 0.0);   // historical: negative evidence is dropped
+    CHECK(s.blocks()[2].lrfu_score == 0.0);
+}
+
+static void test_lrfu_signed_keeps_negative_evidence_and_recovers() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    cfg.lrfu_signed = true;
+    KvMemStore s(cfg);
+    s.register_append(128 * 3);
+    s.set_retrieval_scores({1.0, -0.5, 0.0}, 1);
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    CHECK(s.blocks()[1].lrfu_score == -0.5);
+    CHECK(s.blocks()[1].lrfu_score < s.blocks()[2].lrfu_score);   // ranks below a neutral block
+    CHECK(s.blocks()[1].attn_score == -0.5);
+    // No further penalty: the decay pulls it back toward zero.
+    s.set_retrieval_scores({1.0, 0.0, 0.0}, 2);
+    CHECK(s.blocks()[1].lrfu_score == -0.25);
+    s.set_retrieval_scores({1.0, 0.0, 0.0}, 3);
+    CHECK(s.blocks()[1].lrfu_score == -0.125);
+}
+
+static void test_lrfu_signed_negative_not_gated_by_hit_rule_or_selection() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.deferred_lrfu = true; cfg.lrfu_signed = true;
+    cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 0.5f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({2.0, 1.0, -0.5, 0.0}, 1);
+    // Provisional ranking already reflects the negative block.
+    CHECK(s.blocks()[2].attn_score == -0.5);
+    s.commit_lrfu({0});   // only block 0 was kept
+    CHECK(s.blocks()[0].lrfu_score == 2.0);
+    CHECK(s.blocks()[1].lrfu_score == 0.0);    // positive growth stays selection-gated
+    CHECK(s.blocks()[2].lrfu_score == -0.5);   // negative evidence is not
+}
+
 static void test_lrfu_round_id_is_idempotent() {
     KvMemStoreConfig cfg; cfg.block_tokens = 128;
     cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
@@ -1342,6 +1385,9 @@ int main() {
     test_lrfu_defaults_match_actkv();
     test_lrfu_off_keeps_one_shot_ranking();
     test_lrfu_accumulates_and_decays();
+    test_lrfu_unsigned_ignores_negative_scores();
+    test_lrfu_signed_keeps_negative_evidence_and_recovers();
+    test_lrfu_signed_negative_not_gated_by_hit_rule_or_selection();
     test_lrfu_round_id_is_idempotent();
     test_lrfu_derived_round_is_idempotent();
     test_lrfu_top_frac_masks_low_scores();

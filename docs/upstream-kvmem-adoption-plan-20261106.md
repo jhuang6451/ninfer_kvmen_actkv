@@ -76,3 +76,19 @@
 - 上游 LRFU 与我们的 `clamp 到 0` 取舍不同，二者都没有公开的答案质量对照，**必须以 33 针结果为准**。
 - 本仓库原有的 `docs/actkv-*` 记录显示：端到端编译/真实模型验证在 2026-10-10 移植时并未完成，
   之后 10-11 的 262K 报告是目前唯一的实测证据。
+
+## 5. 实施记录（2026-11-06，未经真实模型验证）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| C 有界 Query | **已实现，默认开启（512）** | 新增 `--kvmem-query-max-tokens N`（0 = 不限）。在 `frontend.cpp` 统一截断 `memory_query` / `action_query` 为末尾 N 个 token，所有下游（检查点、重放、规划）看到的是同一个区间。原先整条用户消息（或原始 token 请求的整段 prompt）都是探针，贴长文档时问题会被稀释 |
+| A LRFU 负分 | **已实现，默认关闭** | 新增 `--kvmem-lrfu-signed`（需 `--kvmem-action-lrfu`）。开启后负相关证据不再被丢弃、KS 不再 clamp 到 0，靠 λ 衰减恢复；正向增长仍受 top-p 与本轮选中集门控。默认关闭是因为本仓库记录过 max 聚合让 256K 召回从 39/40 掉到 28/40，打分对改动很敏感，不应在没验证时改默认行为 |
+| B LRFU 状态按已接受 prefill 提交 | **未做** | 读代码后发现我们已有两阶段提交（`deferred_lrfu` + `commit_lrfu`，只有本轮选中的块才增长）和按前沿推断的幂等轮次，没找到上游机制所解决的具体故障；在没有复现手段时重写状态机风险大于收益 |
+
+改动文件：`kvmem/include/kvmem/kvmem_store.hpp`、`kvmem/src/host/kvmem_store.cpp`、`kvmem/tests/kvmem_store_test.cpp`
+（新增 3 个单测，`kvmem_store_test` 全部通过）；ninfer 侧 `include/ninfer/types.h`、`frontend.{h,cpp}`、
+`model_instance.cpp`、`memory_statistics.cpp`、`serve_options.cpp`，已重新生成 `ninfer-kvmem.patch` 与 `versions.json`
+（`prepare-backends.py --backend ninfer --check` 通过）。
+
+验证范围：核心库单测在宿主机编译并通过；`serve_options.cpp` 单独语法检查通过；`frontend.cpp` 在桩掉 nvtx 头文件后除桩本身外无报错；
+`model_instance.cpp`、`memory_statistics.cpp` 需要 CUDA 头文件，**未编译**。完整构建与实际推理需要在 builder 容器里做。
