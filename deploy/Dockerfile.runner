@@ -25,8 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 清理 GeForce 显卡不兼容的前向兼容库，避免 cudaErrorCompatNotSupportedOnDevice
 RUN rm -rf /usr/local/cuda-13.3/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
 
-COPY dist/bin/ninfer-serve /usr/local/bin/ninfer-serve
-COPY dist/bin/ninfer /usr/local/bin/ninfer
+# 单个 multicall 可执行文件，按 argv[0] 分发；两个名字用符号链接
+COPY dist/bin/ninfer-multicall /usr/local/bin/ninfer-multicall
+RUN ln -s ninfer-multicall /usr/local/bin/ninfer-serve && ln -s ninfer-multicall /usr/local/bin/ninfer
 
 RUN mkdir -p /models && chmod 777 /models
 WORKDIR /models
