@@ -1,6 +1,7 @@
 #include "kvmem/confidence_monitor.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 namespace kvmem {

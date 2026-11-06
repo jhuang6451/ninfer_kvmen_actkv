@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "kvmem/memory_contract.hpp"
 
 namespace kvmem {

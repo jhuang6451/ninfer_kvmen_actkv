@@ -1,6 +1,7 @@
 #pragma once
 #include "kvmem/memory_contract.hpp"
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <vector>
 
