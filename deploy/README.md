@@ -10,10 +10,9 @@
 
 ## 使用顺序
 
-1. 在仓库根目录准备带补丁的后端：`python3 scripts/prepare-backends.py --backend ninfer`
-   （`backends/ninfer` 钉在 `versions.json` 的 base_commit，再应用 `backends/patches/ninfer-kvmem.patch`）。
-2. 构建 builder 镜像：`podman build -f deploy/Dockerfile.builder -t localhost/ninfer-builder:cuda13.3 deploy`
-3. 在 builder 里编译（整个仓库挂到 `/work`，ninfer 需要 `../../kvmem`）：
+1. 构建 builder 镜像：`podman build -f deploy/Dockerfile.builder -t localhost/ninfer-builder:cuda13.3 deploy`
+   （`backends/ninfer` 已直接合入主仓库，无需再执行 `prepare-backends.py --backend ninfer`）。
+2. 在 builder 里编译（整个仓库挂到 `/work`，ninfer 需要 `../../kvmem`）：
    ```bash
    podman run --rm --security-opt label=disable -v "$PWD:/work" -w /work/backends/ninfer \
      localhost/ninfer-builder:cuda13.3 bash -c \
@@ -33,4 +32,4 @@
 
 构建产物都在 `build/`（已被 `.gitignore` 忽略），用完可整个删除。
 
-`--kvmem-action-lrfu` 即 ActKV 开关。模型路径默认 `$HOME/Models/Qwen3.8-27B`，按需覆盖。
+`--kvmem-lrfu --kvmem-keep` 即 KVMem 0.19 历史打分 + 工具/锚点保留开关。模型路径默认 `$HOME/Models/Qwen3.8-27B`，按需覆盖。

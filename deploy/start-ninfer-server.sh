@@ -30,14 +30,14 @@ podman run --name ninfer-actkv-server --rm -it \
     --port "${PORT}" \
     --model-id ninfer-27b \
     --max-context 262144 \
-    --kvmem-recent-tokens 1024 \
+    --kvmem-recent-tokens 64 \
     --prefill-chunk 256 \
     --kvmem-budget 36864 \
     --kvmem-gen-reserve 16384 \
     --kvmem-host-mib 12288 \
-    --kvmem-action-lrfu \
-    --kvmem-lrfu-lambda 0.50 \
-    --kvmem-lrfu-top-frac 0.90 \
+    --kvmem-lrfu \
+    --kvmem-keep \
+    --kvmem-query-scorer page-softmax \
     --kvmem-score-agg mean \
     --kv-dtype rk8v4 \
     --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp \
