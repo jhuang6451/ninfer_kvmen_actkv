@@ -1,270 +1,486 @@
-------------------------------------------------------------------------------------------------------------------------------------
+# KVMem + ActKV · ninfer 后端
 
-  该技术来自 https://arxiv.org/pdf/2609.31395
-  由中国科学技术大学提出
-  
-  在[kvmem@](https://github.com/kvmem/kvmem-llama.cpp)基础开发，通过actkv技术，弥补kvmem在200K以上的上下文中出现的幻觉，工具调用等问题。
-  
-  该技术目前仍处于实验阶段，通过本地多轮测试验证，确认该技术有效，其他个人项目可在本项目基础扩展，开发。actkv技术属于中国科学技术大学其团队。
-  
-  本git项目仅提供参考，不作为标准。
-------------------------------------------------------------------------------------------------------------------------------------
+基于 [kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) 与 **ActKV**
+（[arXiv:2609.31395](https://arxiv.org/pdf/2609.31395)，中国科学技术大学提出）：
 
-启动参数
-  --port 18200 ^
-  --max-context 262144 --kvmem-recent-tokens 1024 ^
+- **KVMem**：把长上下文稀疏成固定窗口（`budget` 历史块 B + `gen_reserve` 工作区 R），
+  Host/磁盘归档其余 KV，用固定大小的注意力窗口换取 200K/262K 可用上下文。
+- **ActKV**：面向行动的检索保持策略（LRFU 历史排序等），提升长会话关键块召回。
+
+QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前往 kvmem 原作者，kvmem已经更新0.19，包含部分新pr提交，https://github.com/kvmem/kvmem/releases/tag/v0.19.0-rc1
+
+**所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
+
+## 更新日志（2026-11-06）
+
+### 1. KVMem pressure 不再因 cold mandatory 页崩溃
+
+问题：长会话 + 历史 restore + 工具锚点时，pressure 重选会检查 mandatory 页（sink / system / tool schema / brief / DFlash2 recent ring）是否仍驻留。某个页被 swap 或 restore 后不在 `state.pages`，旧代码直接抛：
+
+```text
+KVMem pressure cannot recall a cold mandatory page
+```
+
+worker 退出，请求返回 HTTP 500。
+
+修复（`kvmem_window.cpp`）：
+
+- cold mandatory 页有完整 host archive 时，保留在 working set，让 `WindowMemoryBackend` restore
+- 没有持久副本时，从 mandatory 中降级丢弃并打日志，不再打崩 worker
+- 新增日志：`KVMEM_PRESSURE cold_mandatory=N recovered=N dropped=N`
+
+测试（200K 多轮工具调用，dsh OpenAI 协议）：
+
+| 请求 | prompt | prefill | decode | 结果 |
+|---|---:|---:|---:|---|
+| 第一轮 | 201,203 | 804.5 | 35.8 | HTTP 200 |
+| 第二轮 | 251,409 | 751.6 | 74.8 | HTTP 200，restore frontier 201,196 |
+
+```text
+cold_mandatory: none
+ERROR / FATAL / HTTP 500: none
+```
+
+测试脚本：`longctx_pressure.py`（dsh test 目录），按 dsh 的 assistant tool_calls + tool results 历史构造 200K+ prompt。
+
+### 2. NVFP4 草稿头实测
+
+本地找到三份 27B DFlash2 NVFP4 草稿：
+
+| 工件 | 格式 | 能否转换 |
+|---|---|---|
+| `dflash2-nvfp4-modelopt` | ModelOpt NVFP4 | 可以，原样导入 |
+| `yuanlin...NVFP4-drafter` | compressed-tensors NVFP4 | 可以，补 input divisor 兼容 |
+| `Qwen3.8-27B-DFlash2-NVFP4.gguf` | GGML type 40 | 不可以，布局与 ninfer 的 `block_scale_k16_m128x4_v1` 不同 |
+
+转换后草稿格式：
+
+```text
+QKV                    q8_g32_fp16
+gate/up                nvfp4
+attention/output       nvfp4
+mlp/down               nvfp4
+feature_projection     nvfp4
+selector hidden        nvfp4
+conv / norm / codebook bf16
+```
+
+64K 同条件对比（int8 KV，draft 4）：
+
+| 草稿 | prefill | decode | 接受率 | free |
+|---|---:|---:|---:|---:|
+| q3km | 319.0 | 51.0 | 32.3% | 421 MiB |
+| NVFP4 ModelOpt | 325.9 | 49.1 | 32.8% | 464 MiB |
+| NVFP4 yuanlin | 325.3 | 49.3 | 33.0% | 449 MiB |
+
+结论：
+
+```text
+NVFP4 草稿可用，但没有加速
+decode 慢 3.3%–3.7%
+接受率 +0.5–0.7pp，统计上不显著
+模型大 130 MiB，显存基本不变
+```
+
+原因与代码一致：draft 4 走 `tokens <= 4 -> C4 SIMT`，weight-only A16，权重 4.5 bpw，不走 NVGEMM。
+
+### 3. NVFP4 转换器兼容修复
+
+- `tools/convert/nvfp4.py`：`nvfp4_maxabs` 只检查当前矩阵的 activation policy，不再被其他组件的 A8/A4 误拒
+- `tools/convert/sources/compressed_tensors.py`：weight-only NVFP4 缺 `input_global_scale` 时返回 `None`
+- `tools/convert/methods.py`：`import_encoded` 跳过缺失的 input divisor
+
+### 4. WorkBuddy 工具成功锚点
+
+WorkBuddy 使用大写 `Read`/`Edit`/`Write`，并且同一文件会混用 `C:/...` 与 `C:\...`。旧分类只匹配小写，导致成功读取/修改没有进入 keep 锚点，长会话里模型会反复 Read 同一文件。
+
+修复：
+
+- 工具名统一转小写后再分类
+- 路径分隔符统一为 `/`
+- 新增 `memory_tool_successes`，按 `(tool, file)` 去重，只保留最新成功记录
+- keep 新增 4% B 的成功工具锚点，默认保留最近 2 条
+- `KVMEM_PROMPT_PIN` 增加 `tool_success=N`
+
+测试（WorkBuddy 风格 Read/Edit 历史）：
+
+```text
+tool_msgs=4
+tool_success=2
+HTTP 200
+```
+
+服务端只保证成功记录不被压缩，不能阻止客户端重复发起 Read；彻底去重仍需 WorkBuddy/agent 层缓存。
+
+## 更新日志（2026-11-04）
+
+### 1. 工具调用错误/修改锚点
+
+问题：dsh 在大文件 edit 失败后会反复读取同一文件，`old_string not found` / `file changed since it was read` 被上下文压缩掉，模型丢失失败原因，形成 read -> edit 失败 -> read 的循环。
+
+修复：
+
+- 工具消息分类：Call / Result / Error / Mutation / Read
+- Error 最近 2 条固定保留，cap 3% B
+- write/edit 成功结果最近 2 条固定保留，cap 3% B
+- 普通工具消息最近 4 条，cap 8% B
+- 同一文件 read 只保留最近一次，重复读取不再挤占上下文
+- `KVMEM_PROMPT_PIN` 增加 `tool_msgs`
+
+测试（dsh headless，飞机大战.html）：
+
+| 场景 | 工具序列 | 结果 |
+|---|---|---|
+| `lives: 3` -> `lives: 5` | read -> edit -> grep | 一次成功 |
+| `lives: 99` -> `lives: 5` | read -> grep -> edit 失败 -> edit 真实值成功 -> grep | 6 步完成，无重复 read |
+
+之前一次 30 分钟卡住是 dsh 沙箱权限（工作目录 `C:\WINDOWS\system32`，写 `I:\dsh` 被拒绝），不是 KVMem 问题。
+
+提交：`c693456`。
+
+## 更新日志（2026-11-02）
+
+### 1. DFlash2 草稿 KV 精度同步
+修复之前版本接受率低的问题，原因在于dflash2未做参数内kv精度同步，会导致智力降低，精度变差，接受率降低，暂只做了Int8。
+
+DFlash2 的 draft ring 之前硬编码 BF16，与 target 的 `--kv-dtype` 无关。
+新增 `--draft-kv-dtype`：
+
+```text
+bf16   默认，保持旧行为
+int8   draft ring 用 int8 G64，与 target 的 int8 KV 对齐
+```
+
+实现：
+
+```text
+CyclicKVCache 支持 KvCacheStorage + scale planes + BF16 shadow
+D128 int8 append kernel：量化写入 int8，同时写量化后的 BF16 shadow
+sliding_window_attention 直接读 shadow，不再每步解量化
+StateImage 同步 scales/shadow，restore 后重建 shadow
+```
+
+原理：
+
+```text
+draft 的 q 与 target 的 p 精度一致时，接受率上升
+BF16 draft  54.2%
+int8 draft  70.0%
+64K decode  72.8 -> 87.4 tok/s
+greedy 输出与 BF16 完全一致
+
+128K（prompt 163,048，int8 KV，budget 32k，ngram off）
+
+| draft | decode | 接受率 | prefill |
+|---|---|---|---|
+| 4 | 72.7 tok/s | 54.2% (13/24) | 333.3 |
+| 5 | 67.7 tok/s | 44.8% (13/29) | 329.4 |
+| 7 | 47.3 tok/s | 26.7% (12/45) | 333.1 |
+```
+
+### 2. Query replay 崩溃修复
+
+```text
+KVMem query replay has no complete exclusive checkpoint
+```
+
+原因：tool 续接恢复 fork 后的 StateImage 时，QueryReplay checkpoint 已不可用。
+
+修复：`rewind_memory_query` 在 checkpoint 缺失、StateImage 非独占或 fork 未 settle 时返回 false，回退普通 prefill，不再 500。
+
+### 3. ngram copy 收益仲裁恢复
+
+0.19 rebase 时丢失了旧 fork 的 `NgramCopySignal`，ngram 又回到“有匹配就 copy”的行为。
+
+问题：
+
+```text
+短匹配或不准确的 copy 也整轮走 ngram 宽验证
+DFlash2 被跳过，验证宽度从 4 变成 15/31
+copy 一直不中还继续 copy，比神经草稿慢
+```
+
+修复：
+
+```text
+expected_copy = (accepted / drafted) × match_length
+copy 条件     = expected_copy > neural_expected × 1.3
+前 2 轮无条件放行，用于建立样本
+连续 8 轮拒绝后强制探测一轮
+```
+
+实测（8K 复制，DFlash2 draft 4，int8）：
+
+| ngram | decode | ngram 接受 | 结果 |
+|---|---:|---:|---|
+| 0 | 100.6 tok/s | - | 基线 |
+| 15 | 264.5 tok/s | 289/289，20 轮 | 2.6× |
+
+128K 自由生成（prompt 163,065，输出 320 token）：
+
+| ngram | decode | copy 轮 |
+|---|---:|---:|
+| 0 | 42.8 tok/s | - |
+| 15 | 42.0 tok/s | 0 |
+
+128K 下 ngram 没有收益时不触发 copy，decode 与 ngram 0 基本一致；之前 20 token “OK” 测试的 20% 差异来自小样本轮数噪声，不是 ngram 兼容问题。
+
+### 4. DFlash2 草稿环 floor 修复
+
+0.19 rebase 时丢失了 floor 公式里的 `masked_draft_ring_capacity()`。KVMem 重选后只保留一个 recent page（64 token），而 DFlash2 草稿环的 conditioning 容量是 2048 token，接受率被压到 30% 左右。
+
+修复：
+
+```cpp
+floor = max(recent_blocks * 64, draft ring capacity)
+```
+
+覆盖三处：KVMem 重选、query restore、checkpoint restore。
+
+64K（prompt 80,566，输出 2000 token，greedy，ngram 0）：
+
+| | 接受率 | decode |
+|---|---:|---:|
+| 修复前 | 32.7% | 47.9 tok/s |
+| 修复后 | 39.2% | 56.6 tok/s |
+
+### 5. ngram graph 捕获 shadow 污染修复
+
+ngram 开启时，CUDA Graph 捕获会写入 DFlash2 draft ring 的 int8 shadow；捕获后的 `zero_all` 只清零 code，没有清 shadow。slot 被复用时，DFlash2 读到捕获时的 proposal token shadow，接受率从约 65% 掉到 23%。
+
+修复：`zero_slot` / `zero_all` 同步清零 `k_bf16` / `v_bf16` shadow，scales 保留。
+
+8K 鹈鹕骑车，int8 draft，draft 4，ngram 15，8000 token：
+
+| | decode | 接受率 | ngram |
+|---|---:|---:|---:|
+| 修复前 | 45.9 tok/s | 23.3% | 8 轮 |
+| 修复后 | 93.9 tok/s | 66.7% | 101 轮 |
+| no-graph 对照 | 84.9 tok/s | 64.2% | 90 轮 |
+
+### 6. DFlash2 恢复路径与 ngram 竞争修复
+
+- `clamp_masked_draft_floor`：重选/恢复后 floor 高于 conditioning frontier 时自愈，避免整环被 mask。
+- recent 保留页：budget 满时至少保留 draft ring 容量（2048 token / 32 页），避免 draft conditioning 页被换出。64K 复测仍是 39.2%，说明当前瓶颈是 target 远程检索页与 draft 只看最近 2048 token 的不一致，不是 recent 页不足。
+- ngram copy cursor：`NgramCopySignal` 拒绝 match 后清 `ngram_copy_source`，下一轮不再续旧 source。
+- StateImage 恢复：`copy_from_host` / `copy_from_host_segments` 后从 int8 code/scales 重建 BF16 shadow，覆盖 full / Rest-only / contiguous 三条路径。
+
+### 7. 最近工具调用锚点
+
+`--kvmem-keep` 现在会把最近 4 条 tool call / tool result 消息与工具定义一起固定保留：
+
+- assistant tool-call 消息（工具名 + 参数）
+- 对应的 tool result 消息
+- 默认 `tool_recent_messages = 4`，工具示例页 cap 为 `keep * 8%`
+- `KVMEM_PROMPT_PIN` 增加 `tool_msgs` 字段
+
+budget 满时，模型仍能看到上一次成功调用 `write` / `read` 的工具名和格式，降低 `bash` / `read_file` 等错误工具名和 `<tool_call>` 文本格式的概率。
+
+注意：这只保留工具调用示例，不解析 `<tool_call>` XML，也不做工具名别名；这些仍需 parser 容错/别名补丁。
+
+## 更新日志（2026-10-31）
+
+### 1. DFlash2 同步
+
+记录 `pending_features` 的捕获基准（`dflash_pending_base`），append 前校验起点一致；
+所有非 decode 的 frontier 改写点（复用、恢复、forced tokens、快照）同步重置标记。
+192K 262 轮 decode 零违约。
+
+### 2. 思考等级临时切换（dsh）
+
+dsh 聊天窗口可临时切换思考等级（off / low / medium / xhigh）：
+
+- `tool` 消息可携带 `reasoning_effort`，请求顶层未指定时生效（最后一条 tool 优先）；
+- pi-ai UA（`pi (...)`）省略 effort 时解析为 off，解决选 off 仍思考；
+- 顶层显式 effort 始终优先。
+
+注意：Qwen3.8 把思考指令渲染在 **system 开头**，切换等级会改变 prompt 前缀，
+**需要全量 prefill**（192K 约 5–7 分钟）。
+
+### 3. keep 动态开关
+
+`--kvmem-keep` 开启后，sink 和 recent 自动对齐实际上下文：
+
+- sink 取 `[0, first_user)` 的实际页（cap 10% B）；
+- recent 取最后 8 条消息的实际页（cap 15% B）；
+- recent 仅在请求带 tools 时启用，纯文本长对话回退固定 recent。
+
+实测 dsh 32 个工具：system 1,447 / tools 7,364 / task+brief 约 360 token，
+keep 实际占用约 25% B，剩余 75% 留给检索。
+
+### 4. 内核与上游 ninfer 同步
+
+- coupled drafts accept：单次采样同时完成接受判定和修正 token；
+- invariant attention 作为可选项保留（`--invariant-attention`，默认关）；
+- 移植 0.19 checkpoint / speculative store；
+- 修复 FFMPEG 路径转义与 tool schema 顺序。
+
+### 5. GPU 时钟下限
+
+新增 `--gpu-clock-floor-mhz`：NVML 锁 `[floor, max]`，不抬高硬件上限。
+**日常默认 0（不锁频）**；压测或长上下文可设 1500，实测负载 2790 MHz < 3090，非特殊情况可无需启用参数。
+
+### 6. KVMem 最新召回机制
+
+全量 page-softmax + graph 0.2（默认），动态 sink/recent，192K LongMemEval **20/20**。
+
+| 配置 | 召回 | write | prefill | recall decode |
+|---|---|---:|---:|---:|
+| **rk8v4 B=41600，keep 动态（gated）** | **20/20** | **356 s** | **579** | **95.3** |
+| rk8v4 B=41600，无 keep | 20/20 | 365 s | 530–750 | 91.3 |
+
+结论：动态 recent 只服务于带工具的多任务对话；纯文本长对话保持固定 recent，
+避免最近 8 条大消息挤占长召回所需的检索页。
+
+## 当前推荐（2026-10-26）
+
+| 项 | 推荐 |
+|---|---|
+| 工件 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp-q3km.ninfer` |
+| 草稿 | **q3km 直通**（Q4_K×10 + Q3_K×2，conv/norm BF16） |
+| 草稿后端 | **DFlash2**，`draft 4`，`ngram 0`（agent 可用 15） |
+| KV | `nvfp4`，B/R = 36,480 / 16,384（W=52,864） |
+| CUDA Graph | **开**；探针校准 256 MiB，不需要 `--no-cuda-graph` |
+| 驱逐 | 满窗口 100% |
+
+```bat
+  --port 18200 --model-id ninfer-27b --host 0.0.0.0 ^
+  --max-context 262144  ^
   --prefill-chunk 256 ^
-  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --model-id ninfer-27b ^
-  --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
+  --kvmem-budget 41600 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
+  --kvmem-lrfu --kvmem-keep ^
+  --kv-dtype rk8v4 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec dflash2 --draft-tokens 5 --ngram-draft-tokens 31 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort medium  --default-thinking-budget 16384
-  
----
-  --kvmem-action-lrfu 为开启actkv  
-  --vision --vision-residency cpu   --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
+  --default-reasoning-effort xhigh  
+```
 
----
+16 GB 卡启动 free 约 780–955 MiB；B/R 按显卡调整，不要再加 `--no-cuda-graph`。
 
-v1.2更新
+## 性能
 
-1，合并上游ninfer dflash2，模型要求gguf低于10G，否则16G显卡转换后无法运行。
+### 128K 代码（148,774 token，补函数）
 
-2，更新gguf转换ninfer工具，现在支持dfalsh2模型合并，视觉模型支持q8。
+| 后端 | prefill（第一遍） | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| DFlash2 + q3km，draft 4 | 884.6 | 71.5 tok/s | 82.1% | 340.8 s |
+| **MTP + q3km，draft 3** | 887.0 | **76.3 tok/s** | **86.9%** | 340.8 s |
 
-3，修复了部分bug。
+自然停止，输出 120 token。decode 只有约 1.7 s，样本短；用 `ignore_eos` 强制 512 token
+复测：DFlash2 62.5 / 47.1%，MTP 64.7 / 70.0%，方向一致。**代码任务上两者接近，MTP 略快
+3–7%**；旧表里的 DFlash2 87.1 来自更早的二进制，当前版本不再复现。
 
----
+### 128K 总结（126,668 token）
 
-dflash2启动命令
+| 后端 | prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| DFlash2 + q3km，draft 4 | 904.8 | 45.8 | 28.3% | 288.5 s |
+| **MTP + q3km，draft 3** | 904.8 | **47.7** | **40.8%** | 280.9 s |
 
-  --port 18200 ^
-  --max-context 262144 --kvmem-recent-tokens 1024 ^
-  --prefill-chunk 256 ^
-  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --model-id ninfer-27b ^
-  --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp ^
-  --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh  --default-thinking-budget 53248
-  
-  ---
+### 256K（253,099 token，两个启动器）
 
+| 启动器 | 草稿 | KV | prefill（第一遍） | decode | 接受率 | wall |
+|---|---|---|---:|---:|---:|---:|
+| dflash | **draft 4** | nvfp4 | **854.8** | **50.5** | **37.8%** | 597.4 s |
+| mtp | draft 3 adaptive | int8 | 803.3 | 47.5 | 40.7% | 630.9 s |
 
-# 262144 上下文 KVMem + ActKV 召回与速度实测报告
+DFlash2 行为 2026-10-26 复测（q3km、`ngram 0`、当前二进制）；MTP 行仍是旧启动器数据。
+253K prompt、输出 256 token；prefill 报告值 427.9 tok/s 含隐藏 replay，第一遍按两倍折算。
 
-**测试日期**：2026-10-11
-**结论**：33 针全部召回（同轮 33/33、最终 33/33），80 次工具调用全部成功，上下文峰值 **258,467 / 262,144（98.6%）**。Prefill 呈**双平台**特征：池未满时 ~993 tok/s，池满后恒定 ~350 tok/s。
+### 鹈鹕 HTML draft 扫描（72 token prompt，ngram 0）
 
----
+| draft | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|
+| decode | 68.8 | **71.4** | 70.6 | 67.8 | 64.0 |
+| 接受率 | **65.7%** | 54.9% | 48.4% | 42.4% | 38.1% |
 
-## 1. 测试环境
+### 短 prompt / agent
 
-| 项 | 值 |
+| 场景 | decode | 接受率 |
+|---|---:|---:|
+| WebUI 鹈鹕（2 工具，thinking 209） | **96.0 tok/s** | 76.7% |
+| harness（38 工具，thinking 4,826） | 68.2 tok/s | 51.9% |
+| agent 9.8K（ngram 0） | 87.8 tok/s | 70.8% |
+| agent 9.8K（ngram 31 仲裁） | 89.2 tok/s | 68.1% |
+
+### KV 精度
+
+| | `nvfp4` | `rk8v4` |
+|---|---:|---:|
+| 52,864 窗口 runtime | **1.62 GiB** | 1.99 GiB |
+| 启动 free | **835.8 MiB** | 645.9 MiB |
+| 鹈鹕 decode（draft 4） | **73.2 tok/s** | 68.6 tok/s |
+| 接受率 | **58.6%** | 51.3% |
+
+`nvfp4` 是 16 GB 卡默认；`rk8v4` 的 key 保持 INT8，理论长上下文检索更稳，代价是多约
+0.37 GiB、decode 慢约 6%。
+
+### 召回
+
+| 测试 | 结果 |
 |---|---|
-| 模型 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer`（ninfer 后端） |
-| GPU | RTX 5060 Ti 16 GB |
-| KV 量化 | **int8** |
-| KV 池 | `budget 36864` + `gen_reserve 16384` = **53248 token**（832 页 × 64 token） |
-| ActKV | **开启**（`--kvmem-action-lrfu`、λ=0.50、top-frac=0.90） |
-| score-agg | `mean` |
-| recent-tokens | 1024 |
-| 推测解码 | MTP draft 4 + ngram 31 + adaptive |
-| max-context | **262144** |
-| host 归档 | `--kvmem-host-mib 12288`（12 GiB） |
-| 启动方式 | `workers/ninfer/start-kvmem-ninfer.bat` |
-| 二进制 | `937cc2d` 之后（含 A9 修复） |
+| 256K NIAH，33 针 | **33/33**（同轮 / 终轮严格 / 并集） |
+| 256K 跨工具 `send_alert` | **14/14** |
+| 256K 三针（5% / 50% / 95%） | **3/3** |
+| 128K NIAH（5% / 50% / 95%） | **3/3** |
+| LongMemEval 54 题 | **54/60**（ActKV） |
+| Agent 220K | **30/30** 逐轮工具召回 |
 
----
+## 关键修补
 
-## 2. 测试设计
+完整原因、提交和验证数据见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
-```
-15 轮 × 435 行填充  ≈ 16,588 token/轮
-33 针：3 轮 × 3 针 + 12 轮 × 2 针
-4 个工具：record_finding / lookup_metric / get_time / send_alert
-```
-
-**三阶段召回测量**（这是本报告的核心）：
-
-| 阶段 | 问题 | 测什么 |
-|---|---|---|
-| **① 同轮探针** | 每轮写入后**立即**问本轮刚写入的针 | 刚写入、尚未被驱逐的块能否读到 |
-| **② 最终召回** | 15 轮全部写完、历经所有驱逐后，分 3 批问全部 33 针 | **host 冷区召回能力**（核心指标） |
-| **③ 跨工具验证** | 前 14 针改用 `send_alert` 通道再问一遍 | 满上下文下多工具 schema 是否仍正常 |
-
-**判定标准**：**精确子串匹配**（值写错一位即 MISS）。
-
----
-
-## 3. 召回结果
-
-| 阶段 | 结果 | 工具调用 |
-|---|---|---|
-| ① 同轮探针 | **33/33（100%）** | 33 |
-| ② 最终召回（严格，首次） | **33/33（100%）** | 33 |
-| ② 最终召回（含重试并集） | **33/33（100%）** | — |
-| ③ 跨工具验证 | **14/14（100%）** | 14 |
-| **工具调用合计** | **80/80 成功** | **80** |
-
-**33 针逐针结果（同轮 / 最终 / 并集）全部 OK**，无一例外，因此**本轮未触发任何重试**。
-
-### 与上次 40 针测试的对比
-
-| | 40 针测试（232k） | **本次 33 针测试（258k）** |
-|---|---|---|
-| 同轮召回 | 39/40 | **33/33** |
-| 最终召回 | 39/40 | **33/33** |
-| 工具调用 | 80 | **80** |
-| 上下文峰值 | 232,392 | **258,467** |
-
-**上下文更大（+11%）反而 100%** —— 说明上次那 1 个失败（N26）确实是模型偶发转录笔误，不是容量或召回机制问题。
-
----
-
-## 4. 速度实测
-
-### 4.1 写入阶段 prefill（每轮 ~16,588 token）
-
-| 轮 | prompt | prefill | 耗时 | 阶段 |
-|---|---|---|---|---|
-| 1 | 16,564 | **993.2** tok/s | 17.4 s | 池未满 |
-| 2 | 16,192 | **855.0** | 19.1 s | 池未满 |
-| 3 | 16,497 | **725.5** | 23.0 s | 接近池顶 |
-| 4 | 16,587 | **361.1** | 46.1 s | **池已满** |
-| 5 | 16,587 | 359.0 | 46.5 s | 恒定 |
-| 6 | 16,587 | 351.3 | 47.5 s | |
-| 7 | 16,587 | 362.2 | 46.1 s | |
-| 8 | 16,587 | 358.4 | 46.6 s | |
-| 9 | 16,587 | 348.7 | 47.9 s | |
-| 10 | 16,588 | 348.3 | 48.0 s | |
-| 11 | 16,588 | **335.6** | 49.8 s | |
-| 12 | 16,588 | **335.0** | 49.9 s | 最低 |
-| 13 | 16,588 | 349.9 | 47.8 s | |
-| 14 | 16,588 | 352.6 | 47.5 s | |
-| 15 | 16,588 | 359.2 | 46.6 s | |
-
-**统计**：min **335.0** / max **993.2** tok/s，首个 993.2，末个 359.2
-
-#### 关键结论：**双平台特征**
-
-```
-轮 1–3（池未满，累计 <53k） :  725 – 993 tok/s
-轮 4–15（池已满，68k→258k） :  335 – 362 tok/s   ← 12 轮几乎不变
-```
-
-**从 68k 到 258k（3.8 倍上下文），prefill 只从 361 变到 359** —— 完全平坦。
-
-**这证明掉速的分界线是"KV 池是否填满（53248）"，不是上下文长度。** 池满后窗口封顶在 53248，注意力成本固定，速率随之恒定。
-
-### 4.2 同轮探针（短输出 + 工具调用）
-
-| 轮 | prefill | decode | 耗时 | 工具 |
-|---|---|---|---|---|
-| 1 | 175.3 | **94.4** | 1.4 s | 3 |
-| 2 | 98.6 | 61.7 | 2.4 s | 3 |
-| 3 | 84.8 | 75.4 | 2.5 s | 3 |
-| 4–15 | 80.4 – 106.4 | **44.7 – 77.5** | 1.4–2.1 s | 2/轮 |
-
-**prefill 仅 80–175 tok/s** —— 因为探针只追加 ~118 个新 token，**每 chunk 固定开销占主导**，不代表批量 prefill 能力（批量见 4.1 / 4.3）。
-
-### 4.3 最终召回（258k 上下文，每批 11 针）
-
-| 批次 | 针数 | 增量 prompt | prefill | **decode** | 耗时 | 工具 |
-|---|---|---|---|---|---|---|
-| 1 | 11 | 398 | 337.1 tok/s | **132.3** tok/s | 3.0 s | 11 |
-| 2 | 11 | 398 | 329.8 | **111.4** | 3.3 s | 11 |
-| 3 | 11 | 398 | 326.8 | **108.7** | 3.3 s | 11 |
-
-**注意 `prompt 398`** —— 即每批只新增 398 token，**其余 258k 全部缓存命中**。这证明多轮会话的 KV 复用完全正常。
-
-### 4.4 跨工具验证（send_alert）
-
-| 项 | 值 |
+| 类别 | 结论 |
 |---|---|
-| decode | **64.6 – 71.7 tok/s**（14 针高度一致） |
-| 单针耗时 | 1.5 – 1.9 s |
-| 工具调用 | 1/针（全部正确） |
+| KVMem 驱逐 | 满窗口 100%；61K 从 55 次重选降到 **0 次**，wall 82.2 → 75.8 s |
+| KVMem 召回 | ActKV LRFU；LongMemEval 54/60 vs EMA 50/60 |
+| KVMem 传输 | 差异 restore；64K 163 ms → **33–51 ms** |
+| DFlash2 × KVMem | envelope/floor/slot 修复；越窗接受率 1.5% → **42%** |
+| DFlash2 bypass | 按期望收益判定；误关草稿 **0 次** |
+| ngram 仲裁 | copy 只在收益 > 1.3× 草稿时触发；鹈鹕 74.7 vs 72.1 tok/s |
+| CUDA Graph | 探针校准；省 **700–800 MiB**，开图 +6% |
+| NVFP4 | Blackwell 保留 scale `0x7F` → 0（仅编译验证） |
+| 模板缓存 | Jinja trim 后 cache boundary 不再丢失 |
+| 平台 | sm70/sm75 源码支持（未真机验证） |
 
----
+## 模型转换
 
-## 5. 服务端指标
+转换工具从 Releases 下载（Python 3.11 + PyTorch/NumPy）。在 `backends/ninfer` 下运行：
 
-| 指标 | 值 |
-|---|---|
-| **上下文峰值** | **258,467 / 262,144 = 98.6%** |
-| KVMem 重选次数 | **58 次**（全程） |
-| 请求总数 | 79 |
-| **缓存复用率** | 中位 **100.0%**，最低 0%（首轮），<90% 仅 **9/79** |
-| 服务稳定性 | 全程无崩溃 |
-
----
-
-## 6. 综合结论
-
-### ① 召回 100% 可靠 ✅
-
-258k 上下文下 33 针**同轮与最终召回全部命中**，80 次工具调用无一失败，14 次跨工具验证全部正确。
-
-**跨池驱逐后仍能 100% 召回，说明 host 冷区（12 GiB）的驱逐/召回通路完全正常。**
-
-### ② Prefill 是"双平台"，不是连续衰减 ✅
-
-| 区间 | 速率 | 说明 |
-|---|---|---|
-| < 53k（池未满） | **725 – 993 tok/s** | 窗口随上下文增长 |
-| > 53k（池已满） | **335 – 362 tok/s** | 窗口封顶 53248，**恒定** |
-
-**这是设计取舍而非缺陷**：用一个固定 53248 的注意力窗口换取无限上下文。代价是池满后约 350 tok/s，收益是 258k 与 68k 一样快。
-
-### ③ KVMem 开销占比极低 ✅
-
-- 重选 58 次（全程 258k）
-- 单次重选 ~0.4–1.5 s
-- 相邻两轮之间耗时几乎全部是真实 prefill 计算
-
-### ④ 缓存复用是关键性能来源 ✅
-
-后续轮次 `prompt` 增量仅 **398 token**（相对 258k），复用率中位 **100%**。这使多轮对话的 TTFT 稳定在秒级。
-
-### ⑤ 本测试与上次 40 针测试互为印证 ✅
-
-| 对比项 | 40 针（232k） | **33 针（258k）** |
-|---|---|---|
-| 召回 | 39/40（97.5%） | **33/33（100%）** |
-| 上下文 | 232,392 | **258,467** |
-| 失败性质 | 模型单次转录笔误 | 无 |
-
----
-
-## 7. 复现命令
-
-```powershell
-# 1) 启动服务（bat，含 ActKV 参数）
-I:\llama\kvmem-llama.cpp-multi-backend-framework\workers\ninfer\start-kvmem-ninfer.bat
-
-# 2) 全量测试（33 针 / 262k / 80 工具调用，约 16 分钟）
-python I:\dsh\html\niah33_262k.py
-
-# 3) 快速诊断（7 轮，打印模型原始输出，约 4 分钟）
-python I:\dsh\html\niah_diag.py
-
-# 4) 宿主单测
-I:\dsh\html\build-host-tests.bat
+```bash
+python3 -m tools.convert \
+  --model /path/to/conversion-input/metadata \
+  --recipe qwen3_8_27b_gguf \
+  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP.gguf \
+  --source dflash2=Qwen3.8-27B-DFlash2-Q3_K_M.gguf \
+  --source vision=mmproj-Qwen3.8-27B-Q8_0.gguf \
+  --components text,vision,mtp,dflash2 \
+  --name qwen3.8-27b-q3km \
+  --out model.ninfer
 ```
 
-**产物**：
-- 分阶段原始指标：`I:\dsh\html\niah33-262k-metrics.json`
-- 完整运行日志：`I:\dsh\html\niah33-final.log`
-- 服务端日志（含 58 次重选 trace）：`I:\dsh\html\niah33c-server.log`
+- `dflash2` 源支持 GGUF、ModelOpt NVFP4、BF16、per-row FP8；
+- 直通草稿用 `dflash2_gguf_blocks.py`（默认配方）；
+- NVFP4 草稿走 `--override tools/convert/recipes/dflash2_import_nvfp4.py`，
+  详见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)；
+- `kernel_projection` 与 conv 必须保持 BF16（prepare 路径没有量化内核）。
 
----
+## 快速开始
 
-## 8. 测试设计要点（供后续复用）
+1. 下载 `.ninfer` 工件，或按上文自行转换。
+2. 双击 `workers/ninfer/start-kvmem-ninfer-dflash.bat`（DFlash2）或
+   `start-kvmem-ninfer.bat`（MTP）。模型路径和参数都在 bat 里。
+3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
 
-1. **每轮写入必须 >16384 token** 才能持续压迫 KV 池；本测试用 435 行 × 36.61 token ≈ 16,588。
-2. **不要用 450 行/轮 × 15 轮**：会到达 260,948 token，只剩 ~157 token 余量，最终召回的第 2 批必然 `HTTP 400 context length exceeded`。435 行/轮留出 ~11k 余量。
-3. **每轮请求必须带相同的 `tools` 列表**。只在召回阶段加 tools 会改变 chat 模板的 system 段，导致前缀失效（实测表现为 `cache 0 (0.0%)` 并重算全部 223k token）。
-4. **工具调用必须回 `role=tool` + `tool_call_id`**。丢弃 `tool_calls` 会让对话结构非法，模型随后停止调用工具、召回归零 —— 这是之前误判为"召回崩溃"的真实原因。
-5. **判定用精确匹配**，但应同时报告"重试并集"，因为一位数字的笔误会被前者算作完全失败。
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | **所有修补、测速、召回总览** |
+| [docs/dflash2-passthrough-20261026.md](docs/dflash2-passthrough-20261026.md) | q3km 直通、draft 扫描、bypass/floor 细节 |
+| [docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md) | DFlash2 × KVMem 首次修复 |
+| [docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md) | 驱逐水位与 issue #6 |
+| [docs/kvmem-actkv-lrfu-20261020.md](docs/kvmem-actkv-lrfu-20261020.md) | ActKV LRFU 与 LongMemEval |
+| [docs/cuda-graph-calibration.md](docs/cuda-graph-calibration.md) | Graph 探针与启动数据 |
+| [docs/multi-backend.md](docs/multi-backend.md) | 后端能力与启动说明 |
+| [docs/multi-backend-repository.md](docs/multi-backend-repository.md) | 仓库结构与构建 |

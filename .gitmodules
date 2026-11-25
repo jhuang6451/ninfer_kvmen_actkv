@@ -2,7 +2,3 @@
 	path = backends/llamacpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	shallow = true
-[submodule "ninfer"]
-	path = backends/ninfer
-	url = git@github.com:jhuang6451/ninfer-all.git
-	shallow = true

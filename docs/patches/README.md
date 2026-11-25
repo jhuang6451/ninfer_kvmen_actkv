@@ -1,0 +1,61 @@
+# ninfer 子模块补丁
+
+> 2026-10-25 起 `backends/ninfer` 已 vendor 进主仓库，不再是 git 子模块；GitHub 主仓库
+> 可以直接浏览引擎源码。下面的补丁仍按顺序记录引擎相对上游 `8319e8f5` 的改动，恢复步骤
+> 只适用于把引擎当子模块使用的旧 clone。
+
+`backends/ninfer` 指向本地 commit `18e3c7c8`。上游 `iamwavecut/ninfer-all.git` 对当前账号只读（push 返回 403），所以这个 commit 不在任何远程上。新建 clone 后需要按下面的步骤恢复。
+
+## 恢复步骤
+
+```bash
+git submodule update --init backends/ninfer
+cd backends/ninfer
+git checkout 8319e8f5          # 所有补丁的基线
+for p in ../../docs/patches/000*.patch; do git am "$p"; done
+```
+
+应用后的 HEAD 应当是 `2cc993e7`（2026-10-25），`git log --oneline -14` 能看到 13 个补丁提交。
+
+## 补丁一览
+
+| 文件 | 内容 | 来源 |
+|---|---|---|
+| `0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch` | DFlash2 + KVMem 窗口召回，合并页run 传输 | 本地 |
+| `0002-perf-kvmem-start-reselection-at-80-of-the-window.patch` | 重选起点提前到窗口 80% | 本地 |
+| `0003-perf-kvmem-score-token-only-prompts-on-their-tail.patch` | `/v1/completions` 原始文本取尾部打分 | 本地 |
+| `0004-perf-kvmem-restore-only-changed-pages.patch` | 差异 restore，只搬变化的页 | 本地 |
+| `0005-fix-serve-tool-request-sampling-without-presence-penalty.patch` | 带 tools 的请求 `presence_penalty` 归零 | 上游 `bff41bea` 的 cherry-pick |
+| `0006-feat-ops-sm70-and-sm75-build-support-on-the-compatib.patch` | sm70/sm75 的 31 个实现文件与 device profile | 上游 `08fd7019` 的最小移植 |
+| `0007-feat-sm70-sm75-wire-the-compatibility-path-into-mma-.patch` | mma/memory 接入、codec 与 QType 依赖 | 同上 |
+| `0008-perf-kvmem-prepare-RAM-records-ahead-of-prefill-and-.patch` | RAM 记录预准备与候选读取重叠 | 本地 |
+| `0009-feat-nvfp4-register-DFlash2-drafter-matrices-on-both.patch` | NVFP4 线性表注册 DFlash2 五个几何（own + unified） | 本地 |
+| `0010-feat-nvfp4-serve-the-DFlash2-drafter-s-NVFP4-project.patch` | 动态卷积 add 接受 NVFP4 父权重；补两个转换 recipe | 本地 |
+| `0011-feat-startup-calibrate-the-CUDA-graph-allowance-from.patch` | CUDA Graph 启动校准：最小 KV 探针实测，按 256 MiB 规划 | 本地 |
+| `0012-fix-kvmem-reselect-at-the-full-window-again-dropping.patch` | 撤销 0002 的 80% 水位，回到满窗口 W 才重选 | 本地 |
+| `0013-fix-startup-confirm-an-above-floor-CUDA-graph-probe-.patch` | 探针读数高于 256 MiB 时复测一次取较小值 | 本地 |
+
+## 已验证的基线
+
+| 场景 | 配置 | 结果 |
+|---|---|---|
+| 256K NIAH（33 针） | budget 36864 / reserve 16384 / chunk 256 / int8 / MTP draft 4 | 33/33 strict、14/14 cross-tool、80 工具 |
+| 256K real（33 针，生产 system prompt + 10 工具） | 同上 | 33/33 strict、14/14 cross-tool、240 工具 |
+| LongMemEval | 128K / 192K / 240K | 20/20、18/20、16/20 |
+
+## 注意
+
+- 补丁 0001 体积较大（1.1 MB），应用耗时约 10 秒。
+- 0005 与 0004 无文件重叠，顺序无关；其余按编号顺序应用。
+- 0009 注册 DFlash2 的 NVFP4 线性几何，0010 打开动态卷积的 NVFP4 父权重；两者都只在
+  加载 NVFP4 DFlash2 草稿时生效，对 MTP / Q8 草稿无影响。
+- 0010 会一并恢复 `tools/convert/recipes/dflash2_import_nvfp4.py`（ModelOpt NVFP4
+  原样导入）与 `dflash2_nvfp4.py`（重新量化，conv 保持 BF16）。
+- 0011 只改启动与容量规划，不依赖 0009/0010；在 0001–0010 之后按编号应用。探针实测
+  90–143.5 MiB，规划 256 MiB；`--cuda-graph-allowance-mib` 仍优先，`--no-cuda-graph` 跳过。
+- 0012 撤销 0002 的 80% 水位：任何 B/R 都只在 `compact_position > W` 时重选，两次重选
+  之间至少增长一个 R。代价是拿不到“提前交换与 decode 重叠”，换来的是 `B > 4R` 不再
+  thrash（issue #6），也不再触发 checkpoint 前沿冲突。
+- 0013 只影响启动探针的读数稳定性：首次实测超过 256 MiB 时复测一次取较小值，避免
+  WDDM 抖动把规划值抬高到容量上限之外。
+- 若上游后续改动了 `src/serve/translate.cpp` 或 `src/models/qwen3_5/frontend/chat_template.cpp`，0005 可能需要手工解冲突。
