@@ -465,7 +465,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.logprobs       = request.logprobs;
     options.execution.readout_tokens = request.readout_tokens;
     options.execution.speculative_drafting = request.speculative_drafting;
-    options.output.raw                     = false;
+    options.output.raw                     = request.raw_output;
     options.output.preserve_special_tokens =
         (request.tools.empty() || (request.tool_choice.constraints == ToolConstraintMode::Automatic &&
         request.tool_choice.mode == ToolChoiceMode::Auto && request.parallel_tool_calls &&
